@@ -1,17 +1,22 @@
 #!/usr/bin/python3
+"""Decrypt Telegram Desktop's local media cache.
+
+Pure Python - only needs `pycryptodome`. No C compiler, Qt, or
+tgcrypto required, so it also works on Windows.
+"""
+import argparse
 import hashlib
-import cffi
 import os
 
-from PyQt5 import QtCore
-import tgcrypto
+from Crypto.Cipher import AES
+from Crypto.Util import Counter
 
 
 def read_key(name):
-    qstream = readFile(name)
-    salt = qstream.readBytes()
-    key_encrypted = qstream.readBytes()
-    info_encrypted = qstream.readBytes()
+    stream = readFile(name)
+    salt = stream.readBytes()
+    key_encrypted = stream.readBytes()
+    info_encrypted = stream.readBytes()
     info_encrypted
 
     PassKey = createLocalKey(b'', salt)
@@ -52,38 +57,27 @@ def prepareAES_oldmtp(key, msgKey):
     return aesKey, aesIv
 
 
-ffi = cffi.FFI()
-ffi.cdef('''
-void aesIgeDecryptRaw(
-    const unsigned char *src,
-    unsigned char *dst,
-    size_t len,
-    const unsigned char *key,
-    unsigned char *iv);
+def xor_bytes(a, b):
+    return bytes(x ^ y for x, y in zip(a, b))
 
-int PKCS5_PBKDF2_HMAC_SHA1(
-         const char *pass, int passlen,
-         const unsigned char *salt, int saltlen, int iter,
-         int keylen, unsigned char *out);
 
-void my_CRYPTO_ctr128_encrypt(
-    const unsigned char *src,
-    unsigned char *dst,
-    size_t len,
-    const unsigned char *key,
-    int keysize,
-    uint64_t block_index,
-    unsigned char *iv);
-''')
-mydir = os.path.dirname(__file__)
-ffi_openssl = ffi.dlopen(os.path.join(mydir, './ffi_openssl.so'))
-ffi_crypto = ffi.dlopen('libcrypto.so')
+def aes_ige_decrypt(data, key, iv):
+    assert len(data) % 16 == 0
+    aes = AES.new(bytes(key), AES.MODE_ECB)
+    prev_plain = iv[16:32]
+    prev_cipher = iv[:16]
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        c_i = data[i:i + 16]
+        p_i = xor_bytes(aes.decrypt(xor_bytes(c_i, prev_plain)), prev_cipher)
+        out += p_i
+        prev_plain, prev_cipher = p_i, c_i
+    return out
 
 
 def aesDecryptLocal(src, key, key128):
     aesKey, aesIV = prepareAES_oldmtp(key, key128)
-    dst = tgcrypto.ige256_decrypt(src, aesKey, aesIV)
-    return bytearray(dst)
+    return aes_ige_decrypt(src, aesKey, aesIV)
 
 
 def decryptLocal(encrypted, key):
@@ -111,6 +105,23 @@ def createLocalKey(passcode, salt):
     return bytearray(dst)
 
 
+class ByteStream:
+    """Minimal stand-in for Qt's QDataStream::readBytes."""
+
+    def __init__(self, data):
+        self.data = data
+        self.pos = 0
+
+    def readBytes(self):
+        length = int.from_bytes(self.data[self.pos:self.pos + 4], 'big')
+        self.pos += 4
+        if length == 0xFFFFFFFF:
+            return None
+        b = self.data[self.pos:self.pos + length]
+        self.pos += length
+        return b
+
+
 def readFile(name):
     with open(name, 'rb') as f:
         if f.read(4) != b'TDF$':
@@ -130,13 +141,12 @@ def readFile(name):
     if digest != data[-16:]:
         raise ValueError('checksum mismatch')
 
-    qbytes = QtCore.QByteArray(data)
-    return QtCore.QDataStream(qbytes)
+    return ByteStream(data)
 
 
 def readEncryptedFile(name, key):
-    qstream = readFile(name)
-    encrypted = qstream.readBytes()
+    stream = readFile(name)
+    encrypted = stream.readBytes()
     return decryptLocal(encrypted, key)
 
 
@@ -169,27 +179,20 @@ class decryptor:
         self.iv = iv
 
     def decrypt(self, src):
-        dst = bytearray(len(src))
-        buffer = ffi.from_buffer(dst)
-        iv = ffi.from_buffer(bytearray(self.iv))
-        ffi_openssl.my_CRYPTO_ctr128_encrypt(
-            src, buffer, len(src),
-            self.key, len(self.key) * 8,
-            self.block_index, iv
-        )
+        initial_value = (int.from_bytes(self.iv, 'big') + self.block_index) % (1 << 128)
+        counter = Counter.new(128, initial_value=initial_value)
+        cipher = AES.new(bytes(self.key), AES.MODE_CTR, counter=counter)
+        dst = cipher.decrypt(src)
         self.block_index += len(src) // 16
         return dst
 
 
-def main():
-    import os
-
-    LocalKey = read_key('/path/to/key_datas')
-    topdir = os.path.expanduser(
-        '/path/to/user_data')
-    for root, _, files in os.walk(topdir):
+def decrypt_cache(key_datas_path, user_data_dir, output_dir):
+    LocalKey = read_key(key_datas_path)
+    for root, _, files in os.walk(user_data_dir):
+        relroot = os.path.relpath(root, user_data_dir)
+        newdir = os.path.join(output_dir, '' if relroot == '.' else relroot)
         if files:
-            newdir = root[len(topdir):].lstrip('/')
             os.makedirs(newdir, exist_ok=True)
 
         for name in files:
@@ -198,10 +201,25 @@ def main():
 
             path = os.path.join(root, name)
             print('Decrypting', path)
-            data = storage_file_read(path, LocalKey)
-            newf = os.path.join(newdir, name)
-            with open(newf, 'wb') as f:
+            try:
+                data = storage_file_read(path, LocalKey)
+            except ValueError as e:
+                print('  skipped:', e)
+                continue
+            with open(os.path.join(newdir, name), 'wb') as f:
                 f.write(data)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        'key_datas', help="path to tdata's key_datas (or key_data) file")
+    parser.add_argument('user_data', help="path to tdata's user_data directory")
+    parser.add_argument(
+        '-o', '--output', default='.',
+        help="directory to write decrypted files into (default: current directory)")
+    args = parser.parse_args()
+    decrypt_cache(args.key_datas, args.user_data, args.output)
 
 
 if __name__ == '__main__':
